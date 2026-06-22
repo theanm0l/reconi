@@ -1,20 +1,19 @@
-"""Direct module executor — runs recon modules without Celery."""
+"""Direct module executor — runs recon modules without Celery, with clear line-by-line output."""
 
 import asyncio
 import importlib
 import json
 import os
 import pkgutil
+import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
 from rich.console import Console
-from rich.live import Live
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.table import Table
-from rich.text import Text
+from rich.panel import Panel
 
 from .config import AppConfig, load_config
 from .database import SessionLocal, init_db, Target, ReconJob, Finding as DBFinding
@@ -30,17 +29,18 @@ MODULE_CATEGORIES = [
 
 def _discover_modules() -> dict[str, type[ReconModule]]:
     registry: dict[str, type[ReconModule]] = {}
-    base_path = os.path.dirname(os.path.dirname(__file__))
-
-    if not os.path.isdir(os.path.join(base_path, "workers")):
-        base_path = os.path.dirname(base_path)
 
     for category in MODULE_CATEGORIES:
-        category_path = os.path.join(base_path, "workers", category)
-        if not os.path.isdir(category_path):
+        try:
+            pkg = importlib.import_module(f"reconi.workers.{category}")
+            pkg_path = os.path.dirname(pkg.__file__) if pkg.__file__ else ""
+        except ImportError:
             continue
 
-        for _, module_name, _ in pkgutil.iter_modules([category_path]):
+        if not pkg_path or not os.path.isdir(pkg_path):
+            continue
+
+        for _, module_name, _ in pkgutil.iter_modules([pkg_path]):
             if module_name.startswith("_"):
                 continue
             try:
@@ -56,27 +56,21 @@ def _discover_modules() -> dict[str, type[ReconModule]]:
                     ):
                         key = f"{category}/{attr.name}"
                         registry[key] = attr
-            except ImportError as e:
-                pass
             except Exception:
-                continue
+                pass
 
     return registry
 
 
-def _get_module_registry() -> dict[str, type[ReconModule]]:
-    return _discover_modules()
-
-
 def _resolve_modules(config: AppConfig, module_filter: Optional[str] = None) -> list[tuple[str, str, type[ReconModule]]]:
-    registry = _get_module_registry()
+    registry = _discover_modules()
     result: list[tuple[str, str, type[ReconModule]]] = []
 
     if module_filter:
         requested = set(m.strip() for m in module_filter.split(","))
         for key, cls in registry.items():
             cat, name = key.split("/", 1)
-            if key in requested or name in requested:
+            if key in requested or name in requested or (f"{name}" in requested):
                 result.append((cat, name, cls))
         return result
 
@@ -92,42 +86,37 @@ def _resolve_modules(config: AppConfig, module_filter: Optional[str] = None) -> 
     return result
 
 
-async def _run_one_module(
+async def _run_one_module_async(
     module_cls: type[ReconModule],
     target: str,
     job_id: str,
     target_id: str,
-    progress: Progress,
-    task_id: int,
-) -> list[Finding]:
+) -> tuple[str, int, list[str]]:
     module = module_cls()
     label = f"{module.category}/{module.name}"
-    progress.update(task_id, description=f"[cyan]{label}[/cyan]")
+    errors: list[str] = []
 
     try:
         findings = await module.run(target)
-        progress.update(task_id, description=f"[green]{label}[/green]", completed=True)
     except Exception as e:
-        progress.update(
-            task_id,
-            description=f"[red]{label} (failed: {str(e)[:50]})[/red]",
-            completed=True,
-        )
-        return [Finding(
-            source=module.name,
-            type="error",
-            value=str(e),
-            severity="info",
-            confidence=0.0,
-        )]
+        tb = traceback.format_exc()
+        errors.append(f"{label}: {e}")
+        if "--debug" in sys.argv:
+            console.print(f"[red]  {label}: {e}[/red]")
+            console.print(f"[dim]{tb[-500:]}[/dim]")
+        return label, 0, errors
 
     if not findings:
-        progress.update(task_id, description=f"[dim]{label} (0 findings)[/dim]", completed=True)
-        return []
+        return label, 0, []
+
+    non_error = [f for f in findings if f.type != "error"]
+    error_findings = [f for f in findings if f.type == "error"]
+    for ef in error_findings:
+        errors.append(f"{label}: {ef.value[:80]}")
 
     db = SessionLocal()
     try:
-        for f in findings:
+        for f in non_error:
             db_finding = DBFinding(
                 target_id=target_id,
                 job_id=job_id,
@@ -142,38 +131,39 @@ async def _run_one_module(
             )
             db.add(db_finding)
 
+        for f in error_findings:
+            db_finding = DBFinding(
+                target_id=target_id,
+                job_id=job_id,
+                source=f.source,
+                type="error",
+                value=f.value,
+                context=f.context,
+                severity="info",
+                confidence=0.0,
+                raw_json=json.dumps(f.raw) if f.raw else None,
+            )
+            db.add(db_finding)
+
         job = db.query(ReconJob).filter(ReconJob.id == job_id).first()
         if job:
-            job.items_found = len(findings)
+            job.items_found = len(non_error)
             job.status = "completed"
             job.completed_at = datetime.now(timezone.utc)
         db.commit()
     except Exception as e:
         db.rollback()
-        findings.append(Finding(
-            source=module.name,
-            type="db_error",
-            value=str(e),
-            severity="info",
-            confidence=0.0,
-        ))
+        errors.append(f"{label}: DB error: {e}")
     finally:
         db.close()
 
-    count_text = f"({len(findings)})" if findings else "(0)"
-    progress.update(
-        task_id,
-        description=f"[green]{label}[/green] [bold]{count_text}[/bold]",
-        completed=True,
-    )
-    return findings
+    return label, len(non_error), errors
 
 
 def run_scan(
     target: str,
     module_filter: Optional[str] = None,
     config_path: str = "reconi.yaml",
-    parallel: bool = True,
     max_concurrency: int = 5,
 ):
     config = load_config(config_path)
@@ -198,7 +188,6 @@ def run_scan(
             db.commit()
 
         job_ids: list[str] = []
-        display_names: list[str] = []
         for cat, name, _ in modules:
             job = ReconJob(
                 id=str(uuid4()),
@@ -209,63 +198,58 @@ def run_scan(
             )
             db.add(job)
             job_ids.append(job.id)
-            display_names.append(f"{cat}/{name}")
         db.commit()
     finally:
         db.close()
 
     console.print()
     console.print(f"[bold blue]  Recon: [white]{target}[/white][/bold blue]")
-    console.print(f"[dim]  Modules: {len(modules)} | Mode: {'parallel' if parallel else 'sequential'}[/dim]")
+    console.print(f"[dim]  Modules: {len(modules)} | Concurrency: {max_concurrency}[/dim]")
     console.print()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-    ) as progress:
-        all_tasks = [
-            progress.add_task("", total=1, start=False)
-            for _ in modules
-        ]
+    sem = asyncio.Semaphore(max_concurrency)
+    total_findings = 0
+    completed = 0
+    total_errors: list[str] = []
+    t0 = time.monotonic()
 
-        async def _run_all():
-            results: list[list[Finding]] = []
-            sem = asyncio.Semaphore(max_concurrency)
+    async def _run_one(i: int):
+        nonlocal total_findings, completed
+        cat, name, cls = modules[i]
+        job_id = job_ids[i]
+        label = f"{cat}/{name}"
 
-            async def _run_one(i: int):
-                cat, name, cls = modules[i]
-                job_id = job_ids[i]
-                task_id = all_tasks[i]
-                progress.start_task(task_id)
+        async with sem:
+            lbl, count, errs = await _run_one_module_async(
+                cls, target, job_id, target_record.id
+            )
+            total_findings += count
+            completed += 1
+            total_errors.extend(errs)
 
-                async with sem:
-                    findings = await _run_one_module(
-                        cls, target, job_id, target_record.id, progress, task_id
-                    )
-                return findings
+            icon = "[green]✓[/green]" if count > 0 else "[dim]-[/dim]"
+            if errs:
+                icon = "[yellow]![/yellow]"
+            eta = ""
+            if completed > 0:
+                rate = (time.monotonic() - t0) / completed
+                remaining = (len(modules) - completed) * rate
+                eta = f" [dim](ETA: {remaining:.0f}s)[/dim]"
+            console.print(f"  {icon} {label:<40} [dim]{count:>4} findings[/dim]{eta}")
 
-            if parallel:
-                coros = [_run_one(i) for i in range(len(modules))]
-                results = await asyncio.gather(*coros, return_exceptions=True)
-            else:
-                for i in range(len(modules)):
-                    r = await _run_one(i)
-                    results.append(r)
+    async def _run_all():
+        tasks = [_run_one(i) for i in range(len(modules))]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-            return results
+    asyncio.run(_run_all())
 
-        all_findings = asyncio.run(_run_all())
-
-    total_findings = sum(
-        len(f) if isinstance(f, list) else 0
-        for f in (all_findings if isinstance(all_findings, list) else [all_findings])
-    )
-
+    elapsed = time.monotonic() - t0
     console.print()
-    console.print(f"[bold green]  Scan complete: {total_findings} findings across {len(modules)} modules[/bold green]")
+    console.print(f"[bold green]  Scan complete: {total_findings} findings | {elapsed:.1f}s[/bold green]")
+
+    if total_errors:
+        console.print(f"[yellow]  {len(total_errors)} errors (use --debug for details)[/yellow]")
+
     console.print(f"[dim]  Run 'reconi findings -t {target}' to view results[/dim]")
 
-    return all_findings
+    return total_findings
