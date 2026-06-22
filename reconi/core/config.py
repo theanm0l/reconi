@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     )
 
     config_path: str = "reconi.yaml"
-    database_url: str = "postgresql://reconi:reconi@localhost:5432/reconi"
+    database_url: str = "sqlite:///reconi.db"
     redis_url: str = "redis://localhost:6379/0"
     opencode_go_api_key: str = ""
     ollama_host: str = "http://localhost:11434"
