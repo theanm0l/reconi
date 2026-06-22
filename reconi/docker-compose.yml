@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: reconi
+      POSTGRES_USER: reconi
+      POSTGRES_PASSWORD: reconi
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reconi"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: .
+    command: celery -A reconi.core.celery_app worker --loglevel=info --concurrency=10
+    environment:
+      - DATABASE_URL=postgresql://reconi:reconi@postgres:5432/reconi
+      - REDIS_URL=redis://redis:6379/0
+      - OPENCODE_GO_API_KEY=${OPENCODE_GO_API_KEY:-}
+      - RECONI_DATABASE_URL=postgresql://reconi:reconi@postgres:5432/reconi
+      - RECONI_REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./reports:/app/reports
+
+  flower:
+    image: mher/flower:2.0
+    command: celery -A reconi.core.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+volumes:
+  pgdata:
